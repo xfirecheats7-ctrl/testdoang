@@ -1,0 +1,173 @@
+name: Build Flutter APK
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL asset zip project"
+        required: true
+      tag:
+        description: "Tag release"
+        required: true
+      build_type:
+        description: "release / debug"
+        required: false
+        default: "release"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Download project
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          curl -fsSL -L \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/octet-stream" \
+            "$ZIP_URL" -o project.zip
+          mkdir src && unzip -q project.zip -d src
+          PUB=$(find src -name pubspec.yaml -not -path "*/.*" | head -n 1)
+          [ -n "$PUB" ] || { echo "pubspec.yaml tidak ditemukan di zip"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$PUB")" >> $GITHUB_ENV
+
+      - name: Pilih versi Flutter
+        id: fv
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          # Project yang masih memakai font_awesome_flutter 10.x tidak bisa
+          # dikompilasi di Flutter terbaru (IconData jadi final class).
+          # Untuk project seperti itu pakai Flutter lama. Ubah angka di bawah jika perlu.
+          LEGACY="3.35.x"
+          if grep -qE "^\s+font_awesome_flutter:\s*['\"]?\^?10\." pubspec.yaml; then
+            echo "version=$LEGACY" >> $GITHUB_OUTPUT
+            echo "font_awesome_flutter 10.x terdeteksi -> Flutter $LEGACY"
+          else
+            echo "version=" >> $GITHUB_OUTPUT
+            echo "Memakai Flutter stable terbaru"
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ steps.fv.outputs.version }}
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Pastikan folder android ada
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ ! -d android ]; then
+            echo "Folder android tidak ada, membuat ulang..."
+            flutter create --platforms=android .
+          fi
+
+      - name: Auto-fix ikon launcher
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          # Bikin ulang semua ic_launcher.png sebagai PNG valid (8-bit RGB),
+          # apa pun format sumbernya (jpg/webp/png). Mencegah error AAPT
+          # "file failed to compile" karena ikon rusak / bukan PNG asli.
+          if command -v magick >/dev/null 2>&1; then IM="magick"
+          elif command -v convert >/dev/null 2>&1; then IM="convert"
+          else sudo apt-get update -qq && sudo apt-get install -y -qq imagemagick && IM="convert"
+          fi
+
+          # Cari gambar sumber: path dari pubspec dulu, lalu assets/icon/*
+          SRC=""
+          for P in $(grep -E '^\s*image_path(_android)?:' pubspec.yaml | sed -E "s/.*:\s*//; s/['\"]//g; s/\s*#.*//" | tr -d '\r'); do
+            [ -f "$P" ] && SRC="$P" && break
+          done
+          if [ -z "$SRC" ]; then
+            for P in assets/icon/icon.png assets/icon/icon.jpg assets/icon/icon.jpeg assets/icon/icon.webp assets/icon/*.*; do
+              [ -f "$P" ] && SRC="$P" && break
+            done
+          fi
+          RES=android/app/src/main/res
+          # Cadangan: pakai ikon resolusi tertinggi yang masih valid
+          if [ -z "$SRC" ]; then
+            for D in xxxhdpi xxhdpi xhdpi hdpi mdpi; do
+              F="$RES/mipmap-$D/ic_launcher.png"
+              if [ -f "$F" ] && $IM identify "$F" >/dev/null 2>&1; then SRC="$F"; break; fi
+            done
+          fi
+
+          if [ -z "$SRC" ]; then
+            echo "Tidak ada ikon sumber yang valid, hapus ic_launcher.png yang rusak..."
+            rm -f $RES/mipmap-*/ic_launcher.{jpg,jpeg,webp}
+            for F in $RES/mipmap-*/ic_launcher*.png; do
+              [ -f "$F" ] && ! $IM identify "$F" >/dev/null 2>&1 && rm -f "$F" && echo "dihapus: $F"
+            done
+            exit 0
+          fi
+
+          echo "Sumber ikon: $SRC"
+          mkdir -p "$RES"
+          for E in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            D="${E%%:*}"; S="${E##*:}"
+            mkdir -p "$RES/mipmap-$D"
+            OUT="$RES/mipmap-$D/ic_launcher.png"
+            TMP="$(mktemp --suffix=.png)"
+            $IM "${SRC}[0]" -background white -alpha remove -alpha off \
+              -resize "${S}x${S}^" -gravity center -extent "${S}x${S}" \
+              -strip "PNG24:$TMP"
+            mv "$TMP" "$OUT"
+            # ic_launcher.jpg/.jpeg/.webp bentrok dengan .png (Duplicate resources)
+            rm -f "$RES/mipmap-$D"/ic_launcher.{jpg,jpeg,webp} "$RES/mipmap-$D"/ic_launcher_round.{jpg,jpeg,webp}
+            [ -f "$RES/mipmap-$D/ic_launcher_round.png" ] && cp "$OUT" "$RES/mipmap-$D/ic_launcher_round.png"
+          done
+          file $RES/mipmap-*/ic_launcher.png
+
+      - name: Auto-fix Gradle
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          W=android/gradle/wrapper/gradle-wrapper.properties
+          MIN=8.14
+          if [ -f "$W" ]; then
+            CUR=$(grep -oE 'gradle-[0-9]+(\.[0-9]+)*' "$W" | head -n 1 | sed 's/gradle-//')
+            echo "Gradle project: ${CUR:-tidak terdeteksi}"
+            if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$CUR" "$MIN" | sort -V | head -n 1)" != "$MIN" ]; then
+              sed -i -E "s#gradle-[0-9.]+-(all|bin)\.zip#gradle-$MIN-all.zip#" "$W"
+              echo "Gradle dinaikkan ke $MIN"
+            fi
+          fi
+          if [ -d android ]; then
+            touch android/gradle.properties
+            echo >> android/gradle.properties
+            grep -q '^android.newDsl' android/gradle.properties || echo 'android.newDsl=false' >> android/gradle.properties
+          fi
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        run: |
+          MODE=release
+          [ "$BUILD_TYPE" = "debug" ] && MODE=debug
+          flutter build apk --$MODE || {
+            echo "Build pertama gagal, coba ulang dengan skip validasi dependency..."
+            flutter build apk --$MODE --android-skip-build-dependency-validation
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/*.apk
+          retention-days: 1
+
+      - name: Hapus release sementara
+        if: always()
+        run: gh release delete "${{ inputs.tag }}" --cleanup-tag -y --repo "${{ github.repository }}" || true
+        env:
+          GH_TOKEN: ${{ github.token }}

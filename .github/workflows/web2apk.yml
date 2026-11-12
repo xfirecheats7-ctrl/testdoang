@@ -1,0 +1,86 @@
+name: Web to APK
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: "URL website"
+        required: true
+      app_name:
+        description: "Nama aplikasi"
+        required: true
+      icon_url:
+        description: "URL icon png"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Buat project
+        env:
+          WEB_URL: ${{ inputs.web_url }}
+          APP_NAME: ${{ inputs.app_name }}
+        run: |
+          flutter create --org com.web2apk --project-name webapp app
+          cd app
+          flutter pub add webview_flutter
+          cat > lib/main.dart <<DART
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          void main() => runApp(const MaterialApp(debugShowCheckedModeBanner: false, home: Home()));
+          class Home extends StatefulWidget { const Home({super.key}); @override State<Home> createState() => _H(); }
+          class _H extends State<Home> {
+            late final WebViewController c = WebViewController()
+              ..setJavaScriptMode(JavaScriptMode.unrestricted)
+              ..loadRequest(Uri.parse('$WEB_URL'));
+            @override Widget build(BuildContext x) => PopScope(
+              canPop: false,
+              onPopInvokedWithResult: (didPop, result) async { if (!didPop && await c.canGoBack()) c.goBack(); },
+              child: Scaffold(body: SafeArea(child: WebViewWidget(controller: c))));
+          }
+          DART
+          sed -i 's/^          //' lib/main.dart
+          APP_XML=$(printf '%s' "$APP_NAME" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g')
+          APP_ESC=$(printf '%s' "$APP_XML" | sed -e 's/[\\#&]/\\&/g')
+          sed -i "s#android:label=\"[^\"]*\"#android:label=\"$APP_ESC\"#" android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' android/app/src/main/AndroidManifest.xml
+
+      - name: Pasang icon (opsional)
+        continue-on-error: true
+        working-directory: app
+        env:
+          ICON_URL: ${{ inputs.icon_url }}
+        run: |
+          [ -n "$ICON_URL" ] || exit 0
+          curl -fsSL -L -H "Authorization: Bearer ${{ github.token }}" "$ICON_URL" -o icon.png
+          pip install pillow -q || true
+          python3 - <<'PY'
+          from PIL import Image
+          img = Image.open('icon.png').convert('RGBA')
+          for n, s in {'mdpi':48,'hdpi':72,'xhdpi':96,'xxhdpi':144,'xxxhdpi':192}.items():
+              img.resize((s, s)).save(f'android/app/src/main/res/mipmap-{n}/ic_launcher.png')
+          PY
+
+      - name: Build
+        working-directory: app
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web2apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 1
